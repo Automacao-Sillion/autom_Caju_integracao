@@ -1,0 +1,129 @@
+# Troubleshooting: Merge não funcionava no n8n (CPF + Paginação)
+
+Documento de referência do diagnóstico e correção de um fluxo n8n que cruzava dados de **faturamento (CAJU/refeição)** com dados de **funcionários vindos de uma API**, via nó **Merge** por CPF.
+
+---
+
+## Contexto do fluxo
+
+```
+Webhook
+ ├── Converte_para_binário1 → Extrai_os_dados1 → Edit Fields ───────┐
+ │                                                                  ├── Merge → Code in Python
+ └── pattern_HTTP_request → HTTP Request → API_secret →             │
+     HTTP Request1 → Split Out → Edit Fields1 ─────────────────────┘
+```
+
+- **Input 1 (Merge):** faturamento CAJU — campo `CPF`
+- **Input 2 (Merge):** funcionários da API — campo `cpf`
+- **Merge:** Mode `Combine`, Combine By `Matching Fields`, "Fields To Match Have Different Names" ligado (`CPF` × `cpf`), Output Type `Keep Matches`.
+
+**Sintoma inicial:** Merge retornava `No output data returned`.
+
+---
+
+## Problemas encontrados (em ordem de descoberta)
+
+### 1. CPF com tipos e formatos diferentes entre os lados
+Com `Keep Matches`, o Merge só retorna linhas onde os campos casam **exatamente** (valor **e** tipo).
+
+No lado CAJU os CPFs vinham:
+- como **número** na maioria (`12517897654`) e como **texto** em alguns (`"13047433658"`) → número nunca casa com string;
+- com **zeros à esquerda perdidos** porque foram tratados como número:
+  - `2475225203` (era `02475225203`)
+  - `811393305` (era `00811393305`)
+  - `850030420`, `320142108`, etc.
+
+**Correção — normalizar os dois lados** (texto, sem pontuação, 11 dígitos com zeros à esquerda):
+
+```javascript
+// Edit Fields (modo Expression), Type String
+{{ $json.CPF.toString().replace(/\D/g, '').padStart(11, '0') }}
+```
+
+Equivalente para o campo `cpf` no outro lado.
+
+> As últimas linhas do faturamento eram **linhas de totais** ("Total custo", "Saldo disponível" etc.), sem CPF. Viram `00000000000` após o `padStart` e simplesmente não casam — comportamento desejado. Se atrapalharem, filtrar antes (ex.: remover itens sem `Nome Completo`).
+
+### 2. Estrutura aninhada no lado da API
+A API retornava **1 item** contendo um array `items[]` com vários funcionários dentro. O Merge precisa de **um item por funcionário** nos dois lados.
+
+**Correção:** nó **Split Out** com "Fields to Split Out" = `items`, antes do Edit Fields1.
+
+### 3. Campo `cpf` continuava aninhado após o Split Out
+O Split Out devolvia itens com os dados ainda dentro de `items` (`items.cpf`). No n8n, nomear o campo do Edit Fields como `items.cpf` **não navega** dentro do objeto — cria uma chave literal chamada `items.cpf`. O Merge procurava `cpf` no topo e não achava.
+
+**Correção no Edit Fields1:**
+- **Name:** `cpf` (sem o prefixo `items.`)
+- **Value (Expression):**
+  ```javascript
+  {{ $json.items.cpf.toString().replace(/\D/g, '').padStart(11, '0') }}
+  ```
+- **Type:** String
+- **Include Other Input Fields:** **ligado** (senão perde `fullName`, `email`, etc.)
+
+Resultado: `cpf` passa a existir no nível raiz, normalizado.
+
+### 4. A causa raiz real: faltava paginação
+A API retornava `totalItems: 671` em `totalPages: 14`, mas o HTTP Request pegava só **1 página (50 itens)**. Sem todas as páginas, o Merge nunca casaria os 671.
+
+---
+
+## Configuração final da paginação (HTTP Request1)
+
+Paginação nativa do nó HTTP Request (sem loop manual).
+
+**Options → Pagination:**
+- **Pagination Mode:** `Update a Parameter in Each Request`
+- **Parameter:**
+  - **Type:** `Query`  ← importante: a API espera `page` na **query string**, NÃO em header
+  - **Name:** `page`
+  - **Value:** `{{ $pageCount + 1 }}`  (`$pageCount` começa em 0 → primeira requisição manda `page=1`)
+- **Pagination Complete When:** `Other`
+- **Complete Expression** (em **modo Expression**, resistente a `undefined`):
+  ```javascript
+  {{ $pageCount + 1 >= ($response.body?.meta?.totalPages ?? 999) }}
+  ```
+  Alternativa por página vazia:
+  ```javascript
+  {{ ($response.body?.items?.length ?? 0) === 0 }}
+  ```
+- **Interval Between Requests (ms):** ~`300` (opcional, evita martelar a API)
+
+---
+
+## Erros enfrentados na paginação e o que cada um significava
+
+| Erro | Causa | Correção |
+|---|---|---|
+| `Invalid or empty Complete Expression` | Complete Expression estava como `0` (texto fixo), não expressão | Ativar modo **Expression** e usar condição que devolve booleano |
+| Result `[undefined]` no preview | `$response` só existe durante a execução real da paginação, não no editor | Usar `?? 999` (ou `?? 0`) para sempre devolver booleano |
+| `401 - Authorization failed` | Em páginas 2+, `$json` muda de contexto e o token via `$json.key_API` saía vazio | Referenciar o nó pelo nome: `{{ "Bearer " + $('API_secret').item.json.key_API }}` |
+| `The returned response was identical 5x` | O `page` estava sendo enviado como **Header**, e a API o ignorava (sempre retornava página 1) | Enviar `page` como **Query Parameter**, não Header |
+
+---
+
+## Pontos-chave que se repetem em fluxos n8n
+
+- **`Keep Matches` exige casamento exato de valor E tipo.** Normalizar antes do Merge resolve a maioria dos "No output data returned".
+- **Nome de campo com ponto (`items.cpf`) NÃO navega no objeto** — cria chave literal. Para subir um campo aninhado, leia com expressão (`$json.items.cpf`) mas nomeie o destino no topo (`cpf`).
+- **Em paginação, o `$json` muda entre páginas.** Referencie nós anteriores por nome (`$('NomeDoNó').item.json...`), não por `$json`.
+- **`$response` só existe em runtime**, não no preview do editor → expressões de paginação devem tolerar `undefined`.
+- **Query Parameter ≠ Header.** Verificar onde a API realmente espera o parâmetro de página.
+- **`$pageCount` começa em 0.**
+
+---
+
+## Ordem final correta do ramo da API
+
+```
+HTTP Request1 (com paginação)  →  ~14 itens (1 por página, cada um com items[] dentro)
+        ↓
+Split Out (campo: items)       →  ~671 itens individuais
+        ↓
+Edit Fields1 (cpf no topo, normalizado, Include Other Fields ligado)
+        ↓
+Merge (Input 1: CPF | Input 2: cpf | Keep Matches)
+```
+
+**Status no fim da conversa:** paginação confirmada funcionando (mudou de página corretamente). Próximo passo era executar o HTTP Request1 paginado completo e ajustar o Split Out para fechar os 671 itens antes do Merge.
