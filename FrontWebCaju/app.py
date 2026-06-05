@@ -1,6 +1,7 @@
 """
-Envio de planilha — Front Streamlit (Sillion)
-Encaminha planilha (xlsx/xlsb/csv) + email para o backend N8N via POST JSON com base64.
+Integração Caju — Front Streamlit (Sillion)
+Envia planilha (xlsx/xlsb/csv) + email + operação selecionada para o backend N8N
+via POST JSON com base64.
 
 Arquitetura:
 - app.py        → lógica Python (config, envio, widgets de input)
@@ -47,7 +48,7 @@ def resolver_logo_url() -> str:
 # Config da página
 # ============================================================
 st.set_page_config(
-    page_title="Sillion · Novo Fluxo N8N",
+    page_title="Sillion · Integração Caju",
     page_icon="https://www.sillion.com.br/wp-content/themes/sillion/images/logo-white-tm.svg",
     layout="centered",
     initial_sidebar_state="collapsed",
@@ -70,6 +71,9 @@ MIME_FALLBACK = {
     "xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
     "csv": "text/csv",
 }
+
+# Operações disponíveis no fluxo N8N (enviadas como variável `operacao`)
+OPERACOES = ["Recarga", "Cadastro", "Arquivar"]
 
 
 # ============================================================
@@ -127,11 +131,12 @@ def detectar_mime(filename: str) -> str:
     return mime or "application/octet-stream"
 
 
-def montar_payload(email: str, arquivo) -> dict:
-    """Payload reduzido: apenas email + arquivo."""
+def montar_payload(email: str, arquivo, operacao: str) -> dict:
+    """Payload: email + arquivo + operação (Recarga / Cadastro / Arquivar)."""
     conteudo = arquivo.getvalue()
     return {
         "email": email.strip(),
+        "operacao": operacao,
         "filename": arquivo.name,
         "file_base64": base64.b64encode(conteudo).decode("utf-8"),
         "mime_type": detectar_mime(arquivo.name),
@@ -153,8 +158,8 @@ def enviar_para_n8n(url: str, payload: dict) -> requests.Response:
 inject(render_template("header", logo_url=resolver_logo_url()))
 inject(render_template(
     "hero",
-    titulo="Novo Fluxo N8N",
-    subtitulo="Envie a planilha para o fluxo de processamento automático no N8N. "
+    titulo="Integração Caju",
+    subtitulo="Selecione a operação, envie a planilha e o fluxo no N8N fará o processamento automático. "
               "O resultado retornará no seu email.",
 ))
 
@@ -172,13 +177,22 @@ if not WEBHOOK_URL:
 
 
 # ============================================================
-# UI — Formulário (apenas email + planilha)
+# UI — Formulário (email + operação + planilha)
 # ============================================================
 email = st.text_input(
     "Email corporativo",
     placeholder=f"usuario@{DOMINIO_PERMITIDO}",
     help=f"Apenas emails do domínio @{DOMINIO_PERMITIDO} são aceitos. "
          "O resultado processado será enviado para este endereço.",
+)
+
+operacao = st.selectbox(
+    "Operação",
+    options=OPERACOES,
+    index=None,
+    placeholder="Selecione a operação...",
+    help="Operação que o fluxo do N8N deve executar com a planilha. "
+         "Enviada como variável `operacao` no payload.",
 )
 
 arquivo = st.file_uploader(
@@ -212,6 +226,8 @@ if enviar:
             f"Email inválido. Use um endereço corporativo @{DOMINIO_PERMITIDO} "
             "(ex: seu.nome@" + DOMINIO_PERMITIDO + ")."
         )
+    if operacao is None:
+        erros.append("Selecione a operação (Recarga, Cadastro ou Arquivar).")
     if arquivo is None:
         erros.append("Selecione uma planilha para enviar.")
 
@@ -221,7 +237,7 @@ if enviar:
     else:
         with st.spinner("Enviando planilha para processamento..."):
             try:
-                payload = montar_payload(email, arquivo)
+                payload = montar_payload(email, arquivo, operacao)
                 resp = enviar_para_n8n(WEBHOOK_URL, payload)
 
                 if 200 <= resp.status_code < 300:
@@ -229,6 +245,7 @@ if enviar:
                     def confirmacao():
                         st.success("Planilha enviada com sucesso!")
                         st.write(
+                            f"Operação **{operacao}** iniciada. "
                             f"O resultado processado será encaminhado para "
                             f"**{email.strip()}** assim que o backend concluir "
                             "o processamento."
